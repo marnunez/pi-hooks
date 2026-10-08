@@ -8,7 +8,7 @@ Language Server Protocol integration for pi-coding-agent.
 - **Tool** (`lsp-tool.ts`): On-demand LSP queries (definitions, references, hover, symbols, diagnostics, signatures)
 - Manages one LSP server per project root and reuses them across turns
 - **Efficient**: Bounded memory usage via LRU cache and idle file cleanup
-- Supports TypeScript/JavaScript, Vue, Svelte, Dart/Flutter, Python, Go, Kotlin, Swift, and Rust
+- Supports TypeScript/JavaScript, Vue, Svelte, Dart/Flutter, Python, Go, Kotlin, Swift, Rust, and C#
 
 ## Supported Languages
 
@@ -23,8 +23,11 @@ Language Server Protocol integration for pi-coding-agent.
 | Kotlin | `kotlin-ls` | `settings.gradle(.kts)`, `build.gradle(.kts)`, `pom.xml` |
 | Swift | `sourcekit-lsp` | `Package.swift`, Xcode (`*.xcodeproj` / `*.xcworkspace`) |
 | Rust | `rust-analyzer` | `Cargo.toml` |
+| C# | `csharp-ls` | `*.sln`, `*.slnx`, or `*.csproj` |
 
 ### Known Limitations
+
+**C#**: Requires `csharp-ls` and a .NET SDK compatible with your project. Restore dependencies with `dotnet restore` before querying. The extension prefers an ancestor solution directory, falling back to the nearest project directory, within Pi's working directory. Start Pi at the solution root for cross-project navigation. Standalone `.cs` files without a project are not supported. Initial solution loading can take longer than subsequent queries.
 
 **rust-analyzer**: Very slow to initialize (30-60+ seconds) because it compiles the entire Rust project before returning diagnostics. This is a known rust-analyzer behavior, not a bug in this extension. For quick feedback, consider using `cargo check` directly.
 
@@ -34,7 +37,7 @@ Language Server Protocol integration for pi-coding-agent.
 
 Install the package and enable extensions:
 ```bash
-pi install npm:lsp-pi
+pi install git:git@github.com:marnunez/pi-hooks
 pi config
 ```
 
@@ -69,6 +72,13 @@ xcrun sourcekit-lsp --help
 
 # Rust (install via rustup)
 rustup component add rust-analyzer
+
+# C# (NixOS: declare pkgs.csharp-ls in your system/Home Manager packages)
+# Temporary Nix shell for development/testing:
+nix shell nixpkgs#csharp-ls nixpkgs#dotnet-sdk_10
+# Other platforms:
+# dotnet tool install --global csharp-ls
+# Add ~/.dotnet/tools to PATH.
 ```
 
 The extension spawns binaries from your PATH.

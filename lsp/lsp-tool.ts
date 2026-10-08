@@ -16,6 +16,7 @@
  *   - Kotlin (kotlin-ls)
  *   - Swift (sourcekit-lsp)
  *   - Rust (rust-analyzer)
+ *   - C# (csharp-ls)
  *
  * Usage:
  *   pi --extension ./lsp-tool.ts
@@ -33,11 +34,12 @@ const PREVIEW_LINES = 10;
 
 const DIAGNOSTICS_WAIT_MS_DEFAULT = 3000;
 
-function diagnosticsWaitMsForFile(filePath: string): number {
+export function diagnosticsWaitMsForFile(filePath: string): number {
   const ext = path.extname(filePath).toLowerCase();
   if (ext === ".kt" || ext === ".kts") return 30000;
   if (ext === ".swift") return 20000;
   if (ext === ".rs") return 20000;
+  if (ext === ".cs") return 30000;
   return DIAGNOSTICS_WAIT_MS_DEFAULT;
 }
 

@@ -17,18 +17,19 @@ import * as os from "node:os";
 import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { type Diagnostic } from "vscode-languageserver-protocol";
-import { LSP_SERVERS, formatDiagnostic, getOrCreateManager, shutdownManager } from "./lsp-core.js";
+import { LSP_SERVERS, formatDiagnostic, getOrCreateManager, hasCSharpProjectMarker, shutdownManager } from "./lsp-core.js";
 
 type HookScope = "session" | "global";
 type HookMode = "edit_write" | "agent_end" | "disabled";
 
 const DIAGNOSTICS_WAIT_MS_DEFAULT = 3000;
 
-function diagnosticsWaitMsForFile(filePath: string): number {
+export function diagnosticsWaitMsForFile(filePath: string): number {
   const ext = path.extname(filePath).toLowerCase();
   if (ext === ".kt" || ext === ".kts") return 30000;
   if (ext === ".swift") return 20000;
   if (ext === ".rs") return 20000;
+  if (ext === ".cs") return 30000;
   return DIAGNOSTICS_WAIT_MS_DEFAULT;
 }
 const DIAGNOSTICS_PREVIEW_LINES = 10;
@@ -53,6 +54,15 @@ const WARMUP_MAP: Record<string, string> = {
   "gradle.properties": ".kt",
   "Package.swift": ".swift",
 };
+
+export function warmupExtensionForDirectory(cwd: string): string | undefined {
+  for (const [marker, ext] of Object.entries(WARMUP_MAP)) {
+    if (fs.existsSync(path.join(cwd, marker))) return ext;
+  }
+  // C# markers have arbitrary names, unlike the exact filenames above.
+  if (hasCSharpProjectMarker(cwd)) return ".cs";
+  return undefined;
+}
 
 const MODE_LABELS: Record<HookMode, string> = {
   edit_write: "After each edit/write",
@@ -432,20 +442,18 @@ export default function (pi: ExtensionAPI) {
 
     const manager = getOrCreateManager(ctx.cwd);
 
-    for (const [marker, ext] of Object.entries(WARMUP_MAP)) {
-      if (fs.existsSync(path.join(ctx.cwd, marker))) {
-        setActivity("loading");
-        manager.getClientsForFile(path.join(ctx.cwd, `dummy${ext}`))
-          .then((clients) => {
-            if (clients.length > 0) {
-              const cfg = LSP_SERVERS.find((s) => s.extensions.includes(ext));
-              if (cfg) activeClients.add(cfg.id);
-            }
-          })
-          .catch(() => {})
-          .finally(() => setActivity("idle"));
-        break;
-      }
+    const ext = warmupExtensionForDirectory(ctx.cwd);
+    if (ext) {
+      setActivity("loading");
+      manager.getClientsForFile(path.join(ctx.cwd, `dummy${ext}`))
+        .then((clients) => {
+          if (clients.length > 0) {
+            const cfg = LSP_SERVERS.find((s) => s.extensions.includes(ext));
+            if (cfg) activeClients.add(cfg.id);
+          }
+        })
+        .catch(() => {})
+        .finally(() => setActivity("idle"));
     }
   });
 

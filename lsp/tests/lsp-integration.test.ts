@@ -17,7 +17,10 @@ import { mkdtemp, rm, writeFile, mkdir } from "fs/promises";
 import { existsSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join, delimiter } from "path";
-import { LSPManager } from "../lsp-core.js";
+import { LSPManager, collectSymbols } from "../lsp-core.js";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { pathToFileURL } from "node:url";
 
 // ============================================================================
 // Test utilities
@@ -126,6 +129,87 @@ test("typescript: valid code has no errors", async () => {
     await manager.shutdown();
     await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
+});
+
+// ============================================================================
+// C# (.NET 10 / csharp-ls)
+// ============================================================================
+
+async function withCSharpProject(fn: (dir: string, manager: LSPManager, file: string) => Promise<void>): Promise<void> {
+  if (!commandExists("csharp-ls")) skip("csharp-ls not installed");
+  if (!commandExists("dotnet")) skip("dotnet not installed");
+  const run = promisify(execFile);
+  const { stdout: sdks } = await run("dotnet", ["--list-sdks"], { timeout: 10000 });
+  if (!/^10\./m.test(sdks)) skip(".NET 10 SDK not installed");
+
+  const dir = await mkdtemp(join(tmpdir(), "lsp-csharp-"));
+  const manager = new LSPManager(dir);
+  try {
+    const project = join(dir, "App.csproj");
+    await writeFile(project, `<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+</Project>\n`);
+    // Explicit restore is required for Roslyn/MSBuild to resolve framework references.
+    // A restore or server failure is a test failure, never a reason to skip.
+    await run("dotnet", ["restore", project, "--nologo"], { cwd: dir, timeout: 60000 });
+    await fn(dir, manager, join(dir, "Calculator.cs"));
+  } finally {
+    await manager.shutdown();
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function csharpQuery<T>(request: Promise<T>): Promise<T> {
+  let timer: NodeJS.Timeout;
+  try {
+    return await Promise.race([request, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("C# query timed out")), 20000);
+    })]);
+  } finally {
+    clearTimeout(timer!);
+  }
+}
+
+test("csharp: reports an actual type error in a restored net10.0 project", async () => {
+  await withCSharpProject(async (_dir, manager, file) => {
+    await writeFile(file, `public static class Calculator
+{
+    public static string Message() => 123;
+}\n`);
+    const result = await manager.touchFileAndWait(file, 30000);
+    assert(!result.unsupported, result.error || "C# project should be supported");
+    assert(result.receivedResponse, "Expected csharp-ls diagnostics response");
+    assert(result.diagnostics.some(d => d.severity === 1 && String(d.code) === "CS0029" && d.range.start.line === 2),
+      `Expected CS0029 (int to string) on line 3, got: ${JSON.stringify(result.diagnostics)}`);
+  });
+});
+
+test("csharp: valid code responds without errors and supports symbol queries", async () => {
+  await withCSharpProject(async (_dir, manager, file) => {
+    const code = `public static class Calculator
+{
+    public static int Double(int value) => value * 2;
+    public static int Run() => Double(21);
+}\n`;
+    await writeFile(file, code);
+    const result = await manager.touchFileAndWait(file, 30000);
+    assert(!result.unsupported, result.error || "C# project should be supported");
+    assert(result.receivedResponse, "Valid code must receive a diagnostics response, not merely time out");
+    assert(result.diagnostics.every(d => d.severity !== 1), `Expected no errors, got: ${JSON.stringify(result.diagnostics)}`);
+
+    const symbols = await csharpQuery(manager.getDocumentSymbols(file));
+    const names = collectSymbols(symbols).join("\n");
+    assert(names.includes("Calculator") && names.includes("Double"), `Expected class and method symbols, got: ${names}`);
+    const column = code.split("\n")[3].indexOf("Double") + 1;
+    const hover = await csharpQuery(manager.getHover(file, 4, column));
+    assert(hover !== null && JSON.stringify(hover.contents).includes("Double"), `Expected method hover, got: ${JSON.stringify(hover)}`);
+    const definitions = await csharpQuery(manager.getDefinition(file, 4, column));
+    assert(definitions.some(d => d.uri === pathToFileURL(file).href && d.range.start.line === 2),
+      `Expected definition at Double declaration, got: ${JSON.stringify(definitions)}`);
+    const references = await csharpQuery(manager.getReferences(file, 4, column));
+    assert(references.filter(r => r.uri === pathToFileURL(file).href).length >= 2,
+      `Expected declaration and call references, got: ${JSON.stringify(references)}`);
+  });
 });
 
 // ============================================================================

@@ -57,7 +57,7 @@ export const LANGUAGE_IDS: Record<string, string> = {
   ".vue": "vue", ".svelte": "svelte", ".astro": "astro",
   ".py": "python", ".pyi": "python", ".go": "go", ".rs": "rust",
   ".kt": "kotlin", ".kts": "kotlin",
-  ".swift": "swift",
+  ".swift": "swift", ".cs": "csharp",
 };
 
 // Types
@@ -134,6 +134,41 @@ function findNearestFile(startDir: string, targets: string[], stopDir: string): 
 function findRoot(file: string, cwd: string, markers: string[]): string | undefined {
   const found = findNearestFile(path.dirname(file), markers, cwd);
   return found ? path.dirname(found) : undefined;
+}
+
+function csharpProjectMarkers(dir: string): string[] {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true })
+      .filter(entry => entry.isFile())
+      .map(entry => path.extname(entry.name).toLowerCase())
+      .filter(ext => ext === ".sln" || ext === ".slnx" || ext === ".csproj");
+  } catch {
+    return [];
+  }
+}
+
+export function hasCSharpProjectMarker(dir: string): boolean {
+  return csharpProjectMarkers(dir).length > 0;
+}
+
+function findRootCSharp(file: string, cwd: string): string | undefined {
+  const stop = normalizeFsPath(path.resolve(cwd));
+  let current = normalizeFsPath(path.dirname(path.resolve(cwd, file)));
+  const relative = path.relative(stop, current);
+  // Compare actual ancestry, not path lengths or string prefixes. Resolve symlinks
+  // too so a file outside cwd cannot borrow a project from an unrelated tree.
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return undefined;
+
+  let projectRoot: string | undefined;
+  while (true) {
+    const markers = csharpProjectMarkers(current);
+    // A solution may be above the closest project in a multi-project workspace.
+    if (markers.includes(".sln") || markers.includes(".slnx")) return current;
+    if (!projectRoot && markers.includes(".csproj")) projectRoot = current;
+    if (current === stop) break;
+    current = path.dirname(current);
+  }
+  return projectRoot;
 }
 
 function timeout<T>(promise: Promise<T>, ms: number, name: string): Promise<T> {
@@ -413,6 +448,7 @@ export const LSP_SERVERS: LSPServerConfig[] = [
       return { process: proc };
     },
   },
+  { id: "csharp", extensions: [".cs"], findRoot: findRootCSharp, spawn: simpleSpawn("csharp-ls", []) },
   { id: "rust-analyzer", extensions: [".rs"], findRoot: (f, cwd) => findRoot(f, cwd, ["Cargo.toml"]), spawn: simpleSpawn("rust-analyzer", []) },
 ];
 
@@ -639,6 +675,15 @@ export class LSPManager {
       }
 
       return `Kotlin LSP unavailable for root: ${root}`;
+    }
+
+    if (ext === ".cs") {
+      const root = findRootCSharp(absPath, this.cwd);
+      if (!root) return "No C# project root detected (looked for ancestor *.sln, *.slnx or *.csproj within cwd). Standalone C# files are unsupported.";
+      if (!which("csharp-ls")) return "csharp-ls not found on PATH. Install csharp-ls and a compatible .NET SDK, then restore the project with dotnet restore.";
+      const k = this.key("csharp", root);
+      if (this.broken.has(k)) return `csharp-ls failed to initialize for root: ${root}. Check the .NET SDK and run dotnet restore.`;
+      return `C# LSP unavailable for root: ${root}. Check csharp-ls, the .NET SDK and dotnet restore.`;
     }
 
     if (ext === ".swift") {

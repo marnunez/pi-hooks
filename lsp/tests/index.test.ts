@@ -25,6 +25,12 @@ function assertEqual<T>(actual: T, expected: T, message?: string) {
 // ============================================================================
 
 import { uriToPath, findSymbolPosition, formatDiagnostic, filterDiagnosticsBySeverity, collectSymbols } from "../lsp-core.js";
+import { diagnosticsWaitMsForFile } from "../lsp-tool.js";
+
+test("diagnostics timeout: C# project loading gets 30 seconds", () => {
+  assertEqual(diagnosticsWaitMsForFile("Program.cs"), 30000);
+  assertEqual(diagnosticsWaitMsForFile("index.ts"), 3000);
+});
 
 // ============================================================================
 // uriToPath tests

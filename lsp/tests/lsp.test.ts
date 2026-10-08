@@ -10,11 +10,14 @@
  * - Server configuration correctness
  */
 
-import { mkdtemp, rm, writeFile, mkdir } from "fs/promises";
+import { mkdtemp, rm, writeFile, mkdir, symlink, chmod } from "fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { tmpdir } from "os";
 import { join } from "path";
 import { pathToFileURL } from "url";
-import { LSP_SERVERS, LANGUAGE_IDS } from "../lsp-core.js";
+import { LSP_SERVERS, LANGUAGE_IDS, LSPManager } from "../lsp-core.js";
+import { diagnosticsWaitMsForFile, warmupExtensionForDirectory } from "../lsp.js";
 
 // ============================================================================
 // Test utilities
@@ -398,6 +401,125 @@ test("kotlin: finds root with pom.xml", async () => {
     const server = LSP_SERVERS.find(s => s.id === "kotlin")!;
     const root = server.findRoot(join(dir, "src/main/kotlin/Main.kt"), dir);
     assertEquals(root, dir, "Should find root at pom.xml location");
+  });
+});
+
+// ============================================================================
+// C# configuration and project discovery
+// ============================================================================
+
+const csharp = LSP_SERVERS.find(s => s.id === "csharp")!;
+
+test("csharp: language ID, server extensions and hook timeout", async () => {
+  assertEquals(LANGUAGE_IDS[".cs"], "csharp", ".cs should map to csharp");
+  assert(csharp !== undefined, "Should have C# server");
+  assertEquals(csharp.extensions.join(","), ".cs", "Should handle only .cs");
+  assertEquals(diagnosticsWaitMsForFile("Program.cs"), 30000, "Allow time for MSBuild project loading");
+  assertEquals(diagnosticsWaitMsForFile("index.ts"), 3000, "Keep default wait unchanged");
+});
+
+test("csharp: spawns csharp-ls on PATH with no --stdio argument", async () => {
+  await withTempDir({ "bin/csharp-ls": "#!/bin/sh\nexec sleep 30\n" }, async dir => {
+    const binary = join(dir, "bin/csharp-ls");
+    await chmod(binary, 0o755);
+    // Import in a fresh process because the executable search path is captured at import time.
+    const source = `
+      import { LSP_SERVERS } from ${JSON.stringify(new URL("../lsp-core.ts", import.meta.url).href)};
+      const handle = await LSP_SERVERS.find(s => s.id === "csharp").spawn(${JSON.stringify(dir)});
+      if (!handle) throw new Error("Server did not spawn");
+      console.log(JSON.stringify({ args: handle.process.spawnargs, cwd: ${JSON.stringify(dir)} }));
+      handle.process.kill();
+    `;
+    const { stdout } = await promisify(execFile)(process.execPath,
+      ["--import", import.meta.resolve("tsx"), "--input-type=module", "--eval", source],
+      { env: { ...process.env, PATH: `${join(dir, "bin")}${process.platform === "win32" ? ";" : ":"}${process.env.PATH || ""}` }, timeout: 10000 });
+    const result = JSON.parse(stdout.trim());
+    assertEquals(result.args.length, 1, "csharp-ls uses stdio by default, without flags");
+    assertEquals(result.args[0], binary, "Should use csharp-ls from PATH");
+  });
+});
+
+for (const marker of ["Workspace.sln", "Workspace.slnx", "App.csproj"]) {
+  test(`csharp: discovers ${marker} and warms up`, async () => {
+    await withTempDir({ [marker]: "", "src/Program.cs": "class Program {}" }, async dir => {
+      assertEquals(csharp.findRoot(join(dir, "src/Program.cs"), dir), dir, "Should find named marker at cwd");
+      assertEquals(warmupExtensionForDirectory(dir), ".cs", "Should warm up C# for project marker");
+    });
+  });
+}
+
+for (const marker of ["Workspace.sln", "Workspace.slnx"]) {
+  test(`csharp: prefers ancestor ${marker} over nested projects`, async () => {
+    await withTempDir({
+      [marker]: "",
+      "src/App/App.csproj": "",
+      "src/App/Program.cs": "class Program {}",
+      "src/Library/Library.csproj": "",
+      "src/Library/Library.cs": "class Library {}",
+    }, async dir => {
+      for (const file of ["src/App/Program.cs", "src/Library/Library.cs"]) {
+        assertEquals(csharp.findRoot(join(dir, file), dir), dir, "Projects should share the solution root");
+      }
+    });
+  });
+}
+
+test("csharp: nearest solution wins when solutions are nested", async () => {
+  await withTempDir({ "Outer.sln": "", "nested/Inner.slnx": "", "nested/App/App.csproj": "", "nested/App/File.cs": "" }, async dir => {
+    assertEquals(csharp.findRoot(join(dir, "nested/App/File.cs"), dir), join(dir, "nested"), "Should prefer nearest solution");
+  });
+});
+
+test("csharp: nearest project wins without a solution", async () => {
+  await withTempDir({ "Outer.csproj": "", "nested/Inner.csproj": "", "nested/src/File.cs": "" }, async dir => {
+    assertEquals(csharp.findRoot(join(dir, "nested/src/File.cs"), dir), join(dir, "nested"), "Should use nearest csproj");
+  });
+});
+
+test("csharp: does not search above cwd even for a solution", async () => {
+  await withTempDir({ "Outer.slnx": "", "app/App.csproj": "", "app/src/File.cs": "", "standalone/File.cs": "" }, async dir => {
+    assertEquals(csharp.findRoot(join(dir, "app/src/File.cs"), join(dir, "app")), join(dir, "app"), "Solution above cwd must not override local project");
+    assertEquals(csharp.findRoot(join(dir, "standalone/File.cs"), join(dir, "standalone")), undefined, "Solution above cwd must not support standalone file");
+  });
+});
+
+test("csharp: rejects outside files and misleading cwd prefixes", async () => {
+  await withTempDir({ "app/App.csproj": "", "app-other/Other.sln": "", "app-other/src/File.cs": "", "unrelated/deep/Other.csproj": "", "unrelated/deep/File.cs": "" }, async dir => {
+    for (const file of ["app-other/src/File.cs", "unrelated/deep/File.cs"]) {
+      assertEquals(csharp.findRoot(join(dir, file), join(dir, "app")), undefined, "Outside files cannot borrow an unrelated root");
+    }
+  });
+});
+
+test("csharp: uses real ancestry across symlinks", async () => {
+  await withTempDir({ "app/App.csproj": "", "app/File.cs": "", "outside/Other.csproj": "", "outside/File.cs": "" }, async dir => {
+    await symlink(join(dir, "app"), join(dir, "alias"), "dir");
+    await symlink(join(dir, "outside"), join(dir, "app/external"), "dir");
+    assertEquals(csharp.findRoot(join(dir, "alias/File.cs"), join(dir, "alias")), join(dir, "app"), "Symlink cwd should resolve to the real project");
+    assertEquals(csharp.findRoot(join(dir, "app/external/File.cs"), join(dir, "app")), undefined, "Symlink must not escape cwd");
+  });
+});
+
+test("csharp: ignores sibling markers and marker-shaped directories", async () => {
+  await withTempDir({ "sibling/Other.slnx": "", "sibling/Other.csproj": "", "App.csproj": null, "Fake.sln": null, "Fake.slnx": null, "src/File.cs": "class File {}" }, async dir => {
+    assertEquals(csharp.findRoot(join(dir, "src/File.cs"), dir), undefined, "Only ancestor marker files should count");
+    assertEquals(warmupExtensionForDirectory(dir), undefined, "Do not warm up for directories or sibling markers");
+  });
+});
+
+test("csharp: unsupported standalone files explain project requirements", async () => {
+  await withTempDir({ "File.cs": "class File {}" }, async dir => {
+    const manager = new LSPManager(dir);
+    try {
+      const result = await manager.touchFileAndWait(join(dir, "File.cs"), 100);
+      assert(result.unsupported === true, "Standalone C# is unsupported");
+      assert(result.error?.includes("Standalone C# files are unsupported") === true, "Should explain standalone limitation");
+      assert(result.error?.includes("*.slnx") === true && result.error?.includes("*.csproj") === true, "Should list project markers");
+      const batch = await manager.getDiagnosticsForFiles([join(dir, "File.cs")], 100);
+      assertEquals(batch.items[0].status, "unsupported", "Batch diagnostics should also report unsupported");
+    } finally {
+      await manager.shutdown();
+    }
   });
 });
 
